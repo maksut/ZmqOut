@@ -8,59 +8,44 @@
 // InterfaceTable contains pointers to functions in the host (server).
 static InterfaceTable *ft;
 
-struct Msg
+struct Task
 {
-    struct World* world;
-    float* data;
-    size_t dataSize;
+    virtual ~Task() {}
+    virtual void perform() = 0;
 };
 
-class ZmqThread {
-
-    void* mContext;
-
-    SC_SyncCondition mZmkFifoHasData;
+class WorkerThread {
+    SC_SyncCondition mHasData;
 
 #ifdef SUPERNOVA
-    boost::lockfree::queue<Msg, boost::lockfree::capacity<256>> mZmqFifo;
+    boost::lockfree::queue<Task*, boost::lockfree::capacity<512>> mTaskQueue;
 #else
-    boost::lockfree::spsc_queue<Msg, boost::lockfree::capacity<256>> mZmqFifo;
+    boost::lockfree::spsc_queue<Task*, boost::lockfree::capacity<512>> mTaskQueue;
 #endif
 
     std::atomic<bool> mRunning;
-    std::atomic<const char*> mZmqAddress;
-
     SC_Thread mThread;
 
 public:
-    ZmqThread() :mRunning(false), mContext(nullptr), mZmqAddress(nullptr) {}
+    WorkerThread() :mRunning(false) {}
 
-    ~ZmqThread() {
+    ~WorkerThread() {
         if (mRunning) {
             mRunning.store(false);
-            mZmkFifoHasData.Signal();
+            mHasData.Signal();
             mThread.join();
         }
     }
 
     void launchThread() {
-        using namespace std;
-        mRunning.store(true);
-
-        mThread = thread(bind(&ZmqThread::ioThreadFunc, this));
+        mThread = std::thread(std::bind(&WorkerThread::ioThreadFunc, this));
     }
 
-    void connect(const char* zmqAddress)
-    {
-        mZmqAddress.store(zmqAddress);
-        mZmkFifoHasData.Signal();
-    }
-
-    bool send(Msg& msg) {
-        bool pushSucceeded = mZmqFifo.push(msg);
+    bool send(Task* task) {
+        bool pushSucceeded = mTaskQueue.push(task);
 
         if (pushSucceeded)
-            mZmkFifoHasData.Signal();
+            mHasData.Signal();
 
         return pushSucceeded;
     }
@@ -68,56 +53,101 @@ public:
 private:
     void ioThreadFunc() {
         std::cout << "Running the thread" << std::endl;
-
-        void* publisher = nullptr;
+        mRunning.store(true);
 
         while (mRunning.load()) {
-            mZmkFifoHasData.WaitEach();
+            std::cout << "Waiting for new data" << std::endl;
+            mHasData.WaitEach();
+            std::cout << "Got a signal" << std::endl;
 
-            if (publisher == nullptr)
-                publisher = zmqBind();
+            Task* task = nullptr;
+            bool popSucceeded = mTaskQueue.pop(task);
 
-            if (publisher == nullptr)
-            {
-                std::cout << "Oh no. Couldn't bind zmq";
-                continue;
-            }
-
-            Msg msg;
-            bool popSucceeded = mZmqFifo.pop(msg);
+            std::cout << "Pop succeeded" << popSucceeded << std::endl;
 
             if (popSucceeded)
-                zmqSend(publisher, msg);
+                task->perform();
         }
-
-        int rc = zmq_disconnect(publisher, mZmqAddress);
-        std::cout << "zmq_disconnect with rc " << rc << std::endl;
-    }
-
-    void* zmqBind() {
-        std::cout << "BindAction perform with address " << mZmqAddress << std::endl;
-
-        mContext = zmq_ctx_new();
-        void* publisher = zmq_socket(mContext, ZMQ_PUB);
-
-        int rc = zmq_bind(publisher, mZmqAddress);
-
-        std::cout << "zmq_bind with rc " << rc << " and port " << mZmqAddress << std::endl;
-
-        return (rc == 0) ? publisher : nullptr;
-    }
-
-    void zmqSend(void* publisher, Msg& msg)
-    {
-        std::cout << "SendAction perform" << std::endl;
-
-        int rc = zmq_send(publisher, msg.data, msg.dataSize, 0); // FLAGS?
-        std::cout << "zmq_send with rc " << rc << std::endl;
     }
 };
 
-ZmqThread* gZmqIOThread;
+WorkerThread* gWorkerThread;
 
+struct ConnectTask : public Task
+{
+    const char* address;
+    void* publisher;
+    void* context;
+    SC_SyncCondition& complete;
+
+    ConnectTask(const char* address, SC_SyncCondition& complete) :address(address), publisher(nullptr), context(nullptr), complete(complete) {}
+
+    void perform()
+    {
+        std::cout << "ConnectTask perform with address " << address << std::endl;
+
+        context = zmq_ctx_new();
+        publisher = zmq_socket(context, ZMQ_PUB);
+
+        int rc = zmq_bind(publisher, address);
+
+        std::cout << "zmq_bind with rc " << rc << " and port " << address << std::endl;
+        if (rc != 0)
+            std::cout << "error: " << zmq_strerror(errno) << std::endl;
+
+        complete.Signal();
+    }
+};
+
+struct SendTask : public Task
+{
+private:
+    struct World* mWorld;
+    void* mData;
+    size_t mDataSize;
+    void* mPublisher;
+
+    SendTask(struct World* world, void* publisher, void* data, size_t dataSize)
+        :mWorld(world),mData(data),mDataSize(dataSize),mPublisher(publisher){}
+
+public:
+    static SendTask* Create(struct World* world, void* publisher, void* data, size_t dataSize) {
+        std::cout << "Allocating a new SendTask" << std::endl;
+
+        void* buffer = RTAlloc(world, sizeof(SendTask));
+        SendTask* task = new (buffer) SendTask(world, publisher, data, dataSize);
+        std::cout << "Allocated a new SendTask" << std::endl;
+
+        return task;
+    }
+
+    void perform()
+    {
+        std::cout << "SendTask perform" << std::endl;
+
+        int rc = zmq_send(mPublisher, mData, mDataSize, 0); // FLAGS?
+        std::cout << "zmq_send with rc " << rc << std::endl;
+
+        std::cout << "Message is self destructing" << std::endl;
+        // Self destruct!
+        struct World* world = mWorld;
+        NRTLock(world);
+        RTFree(world, this);
+        NRTUnlock(world);
+    }
+};
+
+/*
+//DisconnectTask
+        int rc = zmq_disconnect(publisher, mZmqAddress);
+        std::cout << "zmq_disconnect with rc " << rc << std::endl;
+*/
+
+// zmq context is thread safe
+void* gZmqContext;
+
+// But this socket handle is NOT thread safe. It needs to be created and used in worker thread
+void* gZmqPublisher;
 
 // declare struct to hold unit generator state
 struct ZmqPub : public SCUnit {
@@ -142,11 +172,9 @@ public:
         mData[2] = 0.3f;
         mData[3] = 0.4f;
 
-        Msg msg;
-        msg.world = mWorld;
-        msg.data = mData;
-        msg.dataSize = dataSize;
-        gZmqIOThread->send(msg);
+        auto task = SendTask::Create(mWorld, gZmqPublisher, mData, dataSize);
+
+        gWorkerThread->send(task);
 
         // 1. set the calculation function.
         if (isAudioRateIn(0)) {
@@ -169,7 +197,6 @@ public:
         } else {
             next_k(1);
         }
-     
     }
 
     ~ZmqPub()
@@ -263,16 +290,31 @@ private:
     }
 };
 
-C_LINKAGE SC_API_EXPORT void unload(InterfaceTable* inTable) { delete gZmqIOThread; }
+C_LINKAGE SC_API_EXPORT void unload(InterfaceTable* inTable) {
+    zmq_ctx_destroy(gZmqContext);
+    delete gWorkerThread; 
+}
 
 // the entry point is called by the host when the plug-in is loaded
-PluginLoad(ZmqPubUGens)
-{
+PluginLoad(ZmqPubUGens) {
     std::cout << "ZmqPub plugin load" << std::endl;
 
-    gZmqIOThread = new ZmqThread();
-    gZmqIOThread->launchThread();
-    gZmqIOThread->connect("tcp://127.0.0.1:5555");
+    // DiskIO_UGens does a similar allocation on heap during plugin load. So it must be OK.
+    gWorkerThread = new WorkerThread();
+    gWorkerThread->launchThread();
+
+    // Send a ConnectTask so our thread binds a zmq port.
+    // But wait for it to complete so we can capture the context and publisher socket.
+    SC_SyncCondition complete;
+    ConnectTask connect = ConnectTask("tcp://*:5555", complete);
+    gWorkerThread->send(&connect);
+
+    std::cout << "Waiting for connection to complete" << std::endl;
+    complete.WaitEach(); // wait for connection to complete
+    std::cout << "Connection is complete" << std::endl;
+
+    gZmqContext = connect.context;
+    gZmqPublisher = connect.publisher;
 
     // InterfaceTable *inTable implicitly given as argument to the load function
     ft = inTable; // store pointer to InterfaceTable
