@@ -8,40 +8,175 @@
 // InterfaceTable contains pointers to functions in the host (server).
 static InterfaceTable *ft;
 
-struct Task
+#define MAX_PUB_SOCKETS 32
+#define CONTROLLER_SOCKET_ADDR "ipc://c:/sc/test"
+#define CHECK_ZMQ_RC(OP) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return; }
+#define CHECK_ZMQ_RC(OP, RET) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return RET; }
+
+struct TaskContext
 {
-    virtual ~Task() {}
-    virtual void perform() = 0;
+    World* world;
+    void* zmqContext;
+    void* controllerSocket;
+    void* pubSockets[MAX_PUB_SOCKETS];
+
+    TaskContext(World* world):world(world)
+    {
+        memset(pubSockets, 0, sizeof(void*) * MAX_PUB_SOCKETS);
+        zmqContext = zmq_ctx_new();
+
+        controllerSocket = zmq_socket(zmqContext, ZMQ_PAIR);
+
+        int rc = zmq_bind(controllerSocket, CONTROLLER_SOCKET_ADDR);
+        CHECK_ZMQ_RC("zmq_bind in main");
+    }
+
+    ~TaskContext()
+    {
+        for (int i = 0; i < MAX_PUB_SOCKETS; ++i)
+        {
+            if (pubSockets[i])
+                zmq_close(pubSockets[i]);
+        }
+
+        zmq_ctx_destroy(zmqContext);
+    }
 };
 
-class WorkerThread {
+enum 
+{
+    UNKNOWN = 0,
+    START_PUB_SOCKET = 1,
+    STOP_PUB_SOCKET = 2,
+    PUBLISH = 3,
+};
+
+struct Task
+{
+private:
+    int8_t type;
+    int16_t index;
+    void* data;
+    int dataSize;
+
+public:
+    Task(int8_t type, int16_t index, void* data, int dataSize):type(type),index(index),data(data),dataSize(dataSize){}
+    Task():Task(UNKNOWN, 0, nullptr, 0){}
+
+    void perform(TaskContext& context)
+    {
+        std::cout << "NRTLock" << std::endl;
+        NRTLock(context.world);
+
+        switch (type)
+        {
+        case START_PUB_SOCKET:
+            startPubSocket(context);
+            break;
+        case STOP_PUB_SOCKET:
+            stopPubSocket(context);
+            break;
+        case PUBLISH:
+            publish(context);
+            break;
+        }
+
+        std::cout << "RTFree taskd data" << std::endl;
+        RTFree(context.world, data); // free(0) is no-op
+
+        std::cout << "NRTUnLock" << std::endl;
+        NRTUnlock(context.world);
+    }
+
+private:
+    void startPubSocket(TaskContext& context)
+    {
+        Print("startPubSocket task\n");
+        if (index < 0 || index > MAX_PUB_SOCKETS || !data || dataSize <= 0)
+            return;
+
+        // data should have our address, null terminated
+        const char* address = (char*)data;
+        Print("startPubSocket perform with address %s\n", address);
+
+        // stop the existing socket if any
+        if (context.pubSockets[index])
+        {
+            int rc = zmq_close(context.pubSockets[index]);
+            CHECK_ZMQ_RC("zmq_close on stopPubSocket");
+        }
+
+        context.pubSockets[index] = zmq_socket(context.zmqContext, ZMQ_PUB);
+
+        int rc = zmq_bind(context.pubSockets[index], address);
+        CHECK_ZMQ_RC("zmq_bind in startPubSocket");
+
+        // TODO: send a message back via controller socket
+        Print("startPubSocket task end\n");
+    }
+
+    void stopPubSocket(TaskContext& context)
+    {
+        Print("stopPubSocket task\n");
+        if (index >= MAX_PUB_SOCKETS || index < 0 || !context.pubSockets[index])
+            return;
+
+        int rc = zmq_close(context.pubSockets[index]);
+        CHECK_ZMQ_RC("zmq_close on stopPubSocket");
+
+        // TODO: send a message back via controller socket
+        std::cout << "stopPubSocket task end" << std::endl;
+        Print("stopPubSocket task end\n");
+    }
+
+    void publish(TaskContext& context)
+    {
+        Print("publish task\n");
+
+        if (index < 0 || index > MAX_PUB_SOCKETS || !data || dataSize <= 0 || !context.pubSockets[index])
+            return;
+
+        int rc = zmq_send(context.pubSockets[index], data, dataSize, ZMQ_NOBLOCK);
+        CHECK_ZMQ_RC("zmq_close on stopPubSocket");
+
+        Print("publish task end\n");
+    }
+};
+
+class WorkerThread 
+{
     SC_SyncCondition mHasData;
 
 #ifdef SUPERNOVA
-    boost::lockfree::queue<Task*, boost::lockfree::capacity<512>> mTaskQueue;
+    boost::lockfree::queue<Task, boost::lockfree::capacity<512>> mTaskQueue;
 #else
-    boost::lockfree::spsc_queue<Task*, boost::lockfree::capacity<512>> mTaskQueue;
+    boost::lockfree::spsc_queue<Task, boost::lockfree::capacity<512>> mTaskQueue;
 #endif
 
+    World* mWorld;
     std::atomic<bool> mRunning;
     SC_Thread mThread;
 
 public:
-    WorkerThread() :mRunning(false) {}
+    WorkerThread(World* world) :mRunning(false), mWorld(world) {}
 
-    ~WorkerThread() {
-        if (mRunning) {
+    ~WorkerThread() 
+    {
+        if (mRunning) 
+        {
             mRunning.store(false);
             mHasData.Signal();
             mThread.join();
         }
     }
 
-    void launchThread() {
+    void launchThread() 
+    {
         mThread = std::thread(std::bind(&WorkerThread::ioThreadFunc, this));
     }
 
-    bool send(Task* task) {
+    bool send(Task& task) 
+    {
         bool pushSucceeded = mTaskQueue.push(task);
 
         if (pushSucceeded)
@@ -51,130 +186,63 @@ public:
     }
 
 private:
-    void ioThreadFunc() {
-        std::cout << "Running the thread" << std::endl;
+    void ioThreadFunc() 
+    {
+        Print("Running the thread\n");
         mRunning.store(true);
 
-        while (mRunning.load()) {
-            std::cout << "Waiting for new data" << std::endl;
+        TaskContext context(mWorld);
+
+        while (mRunning.load()) 
+        {
+            Print("Waiting for new data\n");
             mHasData.WaitEach();
-            std::cout << "Got a signal" << std::endl;
+            Print("Got a signal\n");
 
-            Task* task = nullptr;
-            bool popSucceeded = mTaskQueue.pop(task);
+            while (1)
+            {
+                Task task;
+                bool popSucceeded = mTaskQueue.pop(&task, 1);
 
-            std::cout << "Pop succeeded" << popSucceeded << std::endl;
+                Print("popSucceeded=%d\n", popSucceeded);
 
-            if (popSucceeded)
-                task->perform();
+                if (popSucceeded)
+                    task.perform(context);
+                else
+                    break;
+            }
         }
     }
 };
 
-WorkerThread* gWorkerThread;
-
-struct ConnectTask : public Task
-{
-    const char* address;
-    void* publisher;
-    void* context;
-    SC_SyncCondition& complete;
-
-    ConnectTask(const char* address, SC_SyncCondition& complete) :address(address), publisher(nullptr), context(nullptr), complete(complete) {}
-
-    void perform()
-    {
-        std::cout << "ConnectTask perform with address " << address << std::endl;
-
-        context = zmq_ctx_new();
-        publisher = zmq_socket(context, ZMQ_PUB);
-
-        int rc = zmq_bind(publisher, address);
-
-        std::cout << "zmq_bind with rc " << rc << " and port " << address << std::endl;
-        if (rc != 0)
-            std::cout << "error: " << zmq_strerror(errno) << std::endl;
-
-        complete.Signal();
-    }
-};
-
-struct SendTask : public Task
-{
-private:
-    struct World* mWorld;
-    void* mData;
-    size_t mDataSize;
-    void* mPublisher;
-
-    SendTask(struct World* world, void* publisher, void* data, size_t dataSize)
-        :mWorld(world),mData(data),mDataSize(dataSize),mPublisher(publisher){}
-
-public:
-    static SendTask* Create(struct World* world, void* publisher, void* data, size_t dataSize) {
-        std::cout << "Allocating a new SendTask" << std::endl;
-
-        void* buffer = RTAlloc(world, sizeof(SendTask));
-        SendTask* task = new (buffer) SendTask(world, publisher, data, dataSize);
-        std::cout << "Allocated a new SendTask" << std::endl;
-
-        return task;
-    }
-
-    void perform()
-    {
-        std::cout << "SendTask perform" << std::endl;
-
-        int rc = zmq_send(mPublisher, mData, mDataSize, 0); // FLAGS?
-        std::cout << "zmq_send with rc " << rc << std::endl;
-
-        std::cout << "Message is self destructing" << std::endl;
-        // Self destruct!
-        struct World* world = mWorld;
-        NRTLock(world);
-        RTFree(world, this);
-        NRTUnlock(world);
-    }
-};
-
-/*
-//DisconnectTask
-        int rc = zmq_disconnect(publisher, mZmqAddress);
-        std::cout << "zmq_disconnect with rc " << rc << std::endl;
-*/
-
-// zmq context is thread safe
-void* gZmqContext;
-
-// But this socket handle is NOT thread safe. It needs to be created and used in worker thread
-void* gZmqPublisher;
+WorkerThread* gWorkerThread = nullptr;
 
 // declare struct to hold unit generator state
 struct ZmqPub : public SCUnit {
-private:
-    float* mData;
-
 // Constructor usually does 3 things.
 // 1. set the calculation function.
 // 2. initialize the unit generator state variables.
 // 3. calculate one sample of output.
 public:
     ZmqPub() {
-        std::cout << "ZmqPub constructor" << std::endl;
+        Print("ZmqPub constructor\n");
 
         // test zmq pub
-        std::cout << "Sending Hello" << std::endl;
+        Print("Sending Hello\n");
 
         size_t dataSize = sizeof(float) * 4;
-        mData = (float*)RTAlloc(mWorld, dataSize);
-        mData[0] = 0.1f;
-        mData[1] = 0.2f;
-        mData[2] = 0.3f;
-        mData[3] = 0.4f;
+        float* data = (float*)RTAlloc(mWorld, dataSize);
+        data[0] = 0.1f;
+        data[1] = 0.2f;
+        data[2] = 0.3f;
+        data[3] = 0.4f;
 
-        auto task = SendTask::Create(mWorld, gZmqPublisher, mData, dataSize);
-
-        gWorkerThread->send(task);
+        if (gWorkerThread)
+        {
+            // TODO: fetch index from args
+            Task task(PUBLISH, 0/*index*/, data, dataSize);
+            gWorkerThread->send(task);
+        }
 
         // 1. set the calculation function.
         if (isAudioRateIn(0)) {
@@ -197,11 +265,6 @@ public:
         } else {
             next_k(1);
         }
-    }
-
-    ~ZmqPub()
-    {
-        RTFree(mWorld, mData);
     }
 
 private:
@@ -290,32 +353,166 @@ private:
     }
 };
 
+
+// example of implementing a plug in command with async execution.
+
+struct MyPluginData // data for the global instance of the plugin
+{
+    float a, b;
+};
+
+struct MyCmdData // data for each command
+{
+    MyPluginData* myPlugin;
+    float x, y;
+    char* name;
+};
+
+MyPluginData gMyPlugin; // global
+
+bool cmdStage2(World* world, void* inUserData) {
+    // user data is the command.
+    MyCmdData* myCmdData = (MyCmdData*)inUserData;
+
+    // just print out the values
+    Print("cmdStage2 a %g  b %g  x %g  y %g  name %s\n", myCmdData->myPlugin->a, myCmdData->myPlugin->b, myCmdData->x,
+        myCmdData->y, myCmdData->name);
+
+    // ZMQ TEST
+    Print("ZmqPub plugin load\n");
+
+    // DiskIO_UGens does a similar allocation on heap during plugin load. So it must be OK.
+    if (gWorkerThread == nullptr)
+    {
+        gWorkerThread = new WorkerThread(world);
+        gWorkerThread->launchThread();
+    }
+
+    // Send a ConnectTask so our thread binds a zmq port.
+    // But wait for it to complete so we can capture the context and publisher socket.
+
+    char* address = myCmdData->name;
+    Task task(START_PUB_SOCKET, 0, address, strlen(address)+1);
+    gWorkerThread->send(task);
+
+    // now the worker thread owns the address
+    myCmdData->name = 0;
+
+    // TODO: wait for a reply from START_PUB_SOCKET
+
+    return true;
+}
+
+bool cmdStage3(World* world, void* inUserData) {
+    // user data is the command.
+    MyCmdData* myCmdData = (MyCmdData*)inUserData;
+
+    // just print out the values
+    Print("cmdStage3 a %g  b %g  x %g  y %g  name %s\n", myCmdData->myPlugin->a, myCmdData->myPlugin->b, myCmdData->x,
+        myCmdData->y, myCmdData->name);
+
+    // scsynth will perform completion message after this returns
+    return true;
+}
+
+bool cmdStage4(World* world, void* inUserData) {
+    // user data is the command.
+    MyCmdData* myCmdData = (MyCmdData*)inUserData;
+
+    // just print out the values
+    Print("cmdStage4 a %g  b %g  x %g  y %g  name %s\n", myCmdData->myPlugin->a, myCmdData->myPlugin->b, myCmdData->x,
+        myCmdData->y, myCmdData->name);
+
+    // scsynth will send /done after this returns
+    return true;
+}
+
+void cmdCleanup(World* world, void* inUserData) {
+    // user data is the command.
+    MyCmdData* myCmdData = (MyCmdData*)inUserData;
+
+    Print("cmdCleanup a %g  b %g  x %g  y %g  name %s\n", myCmdData->myPlugin->a, myCmdData->myPlugin->b, myCmdData->x,
+        myCmdData->y, myCmdData->name);
+
+    RTFree(world, myCmdData->name); // free the string
+    RTFree(world, myCmdData); // free command data
+    // scsynth will delete the completion message for you.
+}
+
+void cmdZmqPub(World* inWorld, void* inUserData, struct sc_msg_iter* args, void* replyAddr) {
+    Print("->cmdZmqPub %p\n", inUserData);
+
+    // user data is the plug-in's user data.
+    MyPluginData* thePlugInData = (MyPluginData*)inUserData;
+
+    // allocate command data, free it in cmdCleanup.
+    MyCmdData* myCmdData = (MyCmdData*)RTAlloc(inWorld, sizeof(MyCmdData));
+    if (!myCmdData) {
+        Print("cmdZmqPub: memory allocation failed!\n");
+        return;
+    }
+    myCmdData->myPlugin = thePlugInData;
+
+    // ..get data from args..
+    myCmdData->x = 0.;
+    myCmdData->y = 0.;
+    myCmdData->name = 0;
+
+    // float arguments
+    myCmdData->x = args->getf();
+    myCmdData->y = args->getf();
+
+    // how to pass a string argument:
+    const char* name = args->gets(); // get the string argument
+    if (name) {
+        myCmdData->name = (char*)RTAlloc(inWorld, strlen(name) + 1); // allocate space, free it in cmdCleanup.
+        if (!myCmdData->name) {
+            Print("cmdZmqPub: memory allocation failed!\n");
+            return;
+        }
+        strcpy(myCmdData->name, name); // copy the string
+    }
+
+    // how to pass a completion message
+    int msgSize = args->getbsize();
+    char* msgData = 0;
+    if (msgSize) {
+        // allocate space for completion message
+        // scsynth will delete the completion message for you.
+        msgData = (char*)RTAlloc(inWorld, msgSize);
+        if (!msgData) {
+            Print("cmdZmqPub: memory allocation failed!\n");
+            return;
+        }
+        args->getb(msgData, msgSize); // copy completion message.
+    }
+
+    DoAsynchronousCommand(inWorld, replyAddr, "cmdDemoFunc", (void*)myCmdData, (AsyncStageFn)cmdStage2,
+        (AsyncStageFn)cmdStage3, (AsyncStageFn)cmdStage4, cmdCleanup, msgSize, msgData);
+
+    Print("<-cmdDemoFunc\n");
+}
+
+/*
+ * to test the above, send the server these commands:
+ *
+ *
+ * SynthDef(\sine, { Out.ar(0, SinOsc.ar(800,0,0.2)) }).load(s);
+ * s.sendMsg(\cmd, \zmqPub, 7, 9, \mno, [\s_new, \sine, 900, 0, 0]);
+ * s.sendMsg(\n_free, 900);
+ * s.sendMsg(\cmd, \zmqPub, 7, 9, \mno);
+ * s.sendMsg(\cmd, \zmqPub, 7, 9);
+ * s.sendMsg(\cmd, \zmqPub, 7);
+ * s.sendMsg(\cmd, \zmqPub);
+ *
+ */
+
 C_LINKAGE SC_API_EXPORT void unload(InterfaceTable* inTable) {
-    zmq_ctx_destroy(gZmqContext);
     delete gWorkerThread; 
 }
 
 // the entry point is called by the host when the plug-in is loaded
 PluginLoad(ZmqPubUGens) {
-    std::cout << "ZmqPub plugin load" << std::endl;
-
-    // DiskIO_UGens does a similar allocation on heap during plugin load. So it must be OK.
-    gWorkerThread = new WorkerThread();
-    gWorkerThread->launchThread();
-
-    // Send a ConnectTask so our thread binds a zmq port.
-    // But wait for it to complete so we can capture the context and publisher socket.
-    SC_SyncCondition complete;
-    ConnectTask connect = ConnectTask("tcp://*:5555", complete);
-    gWorkerThread->send(&connect);
-
-    std::cout << "Waiting for connection to complete" << std::endl;
-    complete.WaitEach(); // wait for connection to complete
-    std::cout << "Connection is complete" << std::endl;
-
-    gZmqContext = connect.context;
-    gZmqPublisher = connect.publisher;
-
     // InterfaceTable *inTable implicitly given as argument to the load function
     ft = inTable; // store pointer to InterfaceTable
 
@@ -323,4 +520,9 @@ PluginLoad(ZmqPubUGens) {
     // destructor function.
     // However, it does not seem to be possible to disable buffer aliasing with the C++ header.
     registerUnit<ZmqPub>(ft, "ZmqPub");
+
+    // define a plugin command - example code
+    gMyPlugin.a = 1.2f;
+    gMyPlugin.b = 3.4f;
+    DefinePlugInCmd("zmqPub", cmdZmqPub, (void*)&gMyPlugin);
 }
