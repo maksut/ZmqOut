@@ -38,8 +38,9 @@ struct TaskContext
             if (pubSockets[i])
                 zmq_close(pubSockets[i]);
         }
-
+        zmq_close(controllerSocket);
         zmq_ctx_destroy(zmqContext);
+        Print("~TaskContext()\n");
     }
 };
 
@@ -164,9 +165,11 @@ public:
     {
         if (mRunning) 
         {
+            Print("Thread is stopping\n");
             mRunning.store(false);
             mHasData.Signal();
             mThread.join();
+            std::cout << "Thread is stopped\n";
         }
     }
 
@@ -212,6 +215,8 @@ private:
                     break;
             }
         }
+
+        Print("Stopping the thread\n");
     }
 };
 
