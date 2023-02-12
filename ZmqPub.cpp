@@ -4,167 +4,42 @@
 #include <iostream>
 #include <boost/lockfree/queue.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
+#include "rw_spinlock.hpp"
 
 // InterfaceTable contains pointers to functions in the host (server).
 static InterfaceTable *ft;
 
+#define PAYLOAD_SIZE 64
+#define PUB_QUEUE_SIZE 512
 #define MAX_PUB_SOCKETS 32
-#define CONTROLLER_SOCKET_ADDR "ipc://c:/sc/test"
 
-#define CHECK_ZMQ_RC(OP) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return; }
-#define CHECK_ZMQ_RC(OP, RET) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return RET; }
+#define CHECK_ZMQ_RC1(OP) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return; }
+#define CHECK_ZMQ_RC2(OP, RET) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return RET; }
 
-struct TaskContext
+struct Payload
 {
-    World* world;
-    void* zmqContext;
-    void* controllerSocket;
-    void* pubSockets[MAX_PUB_SOCKETS];
-
-    TaskContext(World* world):world(world)
-    {
-        memset(pubSockets, 0, sizeof(void*) * MAX_PUB_SOCKETS);
-        zmqContext = zmq_ctx_new();
-
-        controllerSocket = zmq_socket(zmqContext, ZMQ_PAIR);
-
-        int rc = zmq_bind(controllerSocket, CONTROLLER_SOCKET_ADDR);
-        CHECK_ZMQ_RC("zmq_bind in main");
-    }
-
-    ~TaskContext()
-    {
-        for (int i = 0; i < MAX_PUB_SOCKETS; ++i)
-        {
-            if (pubSockets[i])
-                zmq_close(pubSockets[i]);
-        }
-        zmq_close(controllerSocket);
-        zmq_ctx_destroy(zmqContext);
-        Print("~TaskContext()\n");
-    }
+    float data[PAYLOAD_SIZE];
 };
 
-enum 
-{
-    UNKNOWN = 0,
-    START_PUB_SOCKET = 1,
-    STOP_PUB_SOCKET = 2,
-    PUBLISH = 3,
-};
-
-struct Task
-{
-private:
-    int8_t type;
-    int16_t index;
-    void* data;
-    int dataSize;
-
-public:
-    Task(int8_t type, int16_t index, void* data, int dataSize):type(type),index(index),data(data),dataSize(dataSize){}
-    Task():Task(UNKNOWN, 0, nullptr, 0){}
-
-    void perform(TaskContext& context)
-    {
-        std::cout << "NRTLock" << std::endl;
-        NRTLock(context.world);
-
-        switch (type)
-        {
-        case START_PUB_SOCKET:
-            startPubSocket(context);
-            break;
-        case STOP_PUB_SOCKET:
-            stopPubSocket(context);
-            break;
-        case PUBLISH:
-            publish(context);
-            break;
-        }
-
-        std::cout << "RTFree task data" << std::endl;
-        RTFree(context.world, data); // free(0) is no-op
-
-        std::cout << "NRTUnLock" << std::endl;
-        NRTUnlock(context.world);
-    }
-
-private:
-    void startPubSocket(TaskContext& context)
-    {
-        Print("startPubSocket task\n");
-        if (index < 0 || index > MAX_PUB_SOCKETS || !data || dataSize <= 0)
-            return;
-
-        // data should have our address, null terminated
-        const char* address = (char*)data;
-        Print("startPubSocket perform with address %s\n", address);
-
-        // stop the existing socket if any
-        if (context.pubSockets[index])
-        {
-            int rc = zmq_close(context.pubSockets[index]);
-            CHECK_ZMQ_RC("zmq_close on stopPubSocket");
-        }
-
-        context.pubSockets[index] = zmq_socket(context.zmqContext, ZMQ_PUB);
-
-        int rc = zmq_bind(context.pubSockets[index], address);
-        CHECK_ZMQ_RC("zmq_bind in startPubSocket");
-
-        // TODO: send a message back via controller socket
-        Print("startPubSocket task end\n");
-    }
-
-    void stopPubSocket(TaskContext& context)
-    {
-        Print("stopPubSocket task\n");
-        if (index >= MAX_PUB_SOCKETS || index < 0 || !context.pubSockets[index])
-            return;
-
-        int rc = zmq_close(context.pubSockets[index]);
-        CHECK_ZMQ_RC("zmq_close on stopPubSocket");
-
-        // TODO: send a message back via controller socket
-        std::cout << "stopPubSocket task end" << std::endl;
-        Print("stopPubSocket task end\n");
-    }
-
-    void publish(TaskContext& context)
-    {
-        Print("publish task\n");
-
-        if (index < 0 || index > MAX_PUB_SOCKETS || !data || dataSize <= 0 || !context.pubSockets[index])
-            return;
-
-        int rc = zmq_send(context.pubSockets[index], data, dataSize, ZMQ_NOBLOCK);
-        CHECK_ZMQ_RC("zmq_close on stopPubSocket");
-
-        Print("publish task end\n");
-    }
-};
-
-class WorkerThread 
+class PubWorkerThread
 {
     SC_SyncCondition mHasData;
 
 #ifdef SUPERNOVA
-    boost::lockfree::queue<Task, boost::lockfree::capacity<512>> mTaskQueue;
+    boost::lockfree::queue<Payload, boost::lockfree::capacity<PUB_QUEUE_SIZE>> mPubQueue;
 #else
-    boost::lockfree::spsc_queue<Task, boost::lockfree::capacity<512>> mTaskQueue;
+    boost::lockfree::spsc_queue<Payload, boost::lockfree::capacity<PUB_QUEUE_SIZE>> mPubQueue;
 #endif
 
-    World* mWorld;
     std::atomic<bool> mRunning;
     SC_Thread mThread;
 
 public:
-    WorkerThread(World* world) :mRunning(false), mWorld(world) {}
+    PubWorkerThread() :mRunning(false) {}
 
-    ~WorkerThread() 
+    ~PubWorkerThread()
     {
-        if (mRunning) 
+        if (mRunning)
         {
             Print("Thread is stopping\n");
             mRunning.store(false);
@@ -174,14 +49,14 @@ public:
         }
     }
 
-    void launchThread() 
+    void launchThread(void* zmqContext, const char* address)
     {
-        mThread = std::thread(std::bind(&WorkerThread::ioThreadFunc, this));
+        mThread = std::thread(std::bind(&PubWorkerThread::ioThreadFunc, this, zmqContext, address));
     }
 
-    bool send(Task& task) 
+    bool send(Payload& payload) 
     {
-        bool pushSucceeded = mTaskQueue.push(task);
+        bool pushSucceeded = mPubQueue.push(payload);
 
         if (pushSucceeded)
             mHasData.Signal();
@@ -190,12 +65,15 @@ public:
     }
 
 private:
-    void ioThreadFunc() 
+    void ioThreadFunc(void* zmqContext, const char* address) 
     {
         Print("Running the thread\n");
         mRunning.store(true);
 
-        TaskContext context(mWorld);
+        void* pubSocket = zmq_socket(zmqContext, ZMQ_PUB);
+
+        int rc = zmq_bind(pubSocket, address);
+        CHECK_ZMQ_RC1("zmq_bind in startPubSocket");
 
         while (mRunning.load()) 
         {
@@ -204,16 +82,81 @@ private:
             Print("Got a signal\n");
 
             // Consumes all avaiable tasks from the queue, one at a time
-            Task task;
-            while(mTaskQueue.pop(&task, 1))
-                task.perform(context);
+            Payload payload;
+            while (mPubQueue.pop(&payload, 1))
+            {
+                Print("publishing payload\n");
+
+                int rc = zmq_send(pubSocket, payload.data, sizeof(payload.data), ZMQ_NOBLOCK);
+                CHECK_ZMQ_RC1("zmq_send on payload send");
+
+                Print("publishing payload end\n");
+            }
         }
 
+        zmq_close(pubSocket);
         Print("Stopping the thread\n");
     }
 };
 
-WorkerThread* gWorkerThread = nullptr;
+class ThreadContainer
+{
+    PubWorkerThread* threads[MAX_PUB_SOCKETS];
+    void* zmqContext = nullptr;
+    rw_spinlock lock;
+
+public:
+    void start(int index, const char* address)
+    {
+        rw_spinlock::scoped_lock _(lock);
+
+        if (threads[index])
+            delete threads[index];
+
+        threads[index] = new PubWorkerThread();
+
+        if (!zmqContext)
+            zmqContext = zmq_ctx_new();
+
+        threads[index]->launchThread(zmqContext, address);
+    }
+
+    void stop(int index)
+    {
+        rw_spinlock::scoped_lock _(lock);
+
+        if (threads[index])
+            delete threads[index];
+
+        threads[index] = nullptr;
+    }
+
+    void send(int index, Payload& payload)
+    {
+        if (!lock.try_lock_shared())
+            return;
+
+        if (threads[index])
+            threads[index]->send(payload);
+
+        lock.unlock_shared();
+    }
+
+    ~ThreadContainer()
+    {
+        rw_spinlock::scoped_lock _(lock);
+
+        for (int i = 0; i < MAX_PUB_SOCKETS; ++i)
+        {
+            if (threads[i])
+                delete threads[i];
+        }
+
+        zmq_ctx_destroy(zmqContext);
+    }
+};
+
+ThreadContainer* gThreadContainer = nullptr;
 
 // declare struct to hold unit generator state
 struct ZmqPub : public SCUnit {
@@ -226,7 +169,8 @@ public:
         Print("ZmqPub constructor\n");
 
         // Initialize the unit generator state variables.
-        allocateBuffer();
+        index = 0; // TODO: fetch from args
+        payloadIndex = 0;
 
         // Set the calculation function. set_calc_function also computes the initial sample
         if (isAudioRateIn(0))
@@ -237,8 +181,8 @@ public:
     }
 
 private:
-    float* buffer;
-    int bufferSize;
+    Payload payload;
+    int payloadIndex;
     int index;
 
     // The calculation function executes once per control period
@@ -287,33 +231,16 @@ private:
 
     inline void stream(float sample)
     {
-        buffer[index++] = sample;
+        if (!gThreadContainer)
+            return;
 
-        if (index > bufferSize)
+        payload.data[payloadIndex++] = sample;
+
+        if (payloadIndex > PAYLOAD_SIZE)
         {
-            if (gWorkerThread)
-            {
-                Print("Sending the buffer\n");
-                // TODO: fetch index from args
-                Task task(PUBLISH, 0/*index*/, buffer, sizeof(float) * bufferSize);
-                gWorkerThread->send(task);
-
-                // the thread will take ownership of that buffer so allocate a new one
-                allocateBuffer();
-            }
-            else
-            {
-                Print("Thread is not alive resetting the buffer\n");
-                index = 0;
-            }
+            gThreadContainer->send(index, payload);
+            payloadIndex = 0;
         }
-    }
-
-    void allocateBuffer()
-    {
-        bufferSize = 64; // TODO: fetch this from args, bufferSize must be greater than zero
-        buffer = (float*)RTAlloc(mWorld, sizeof(float)*bufferSize);
-        index = 0;
     }
 };
 
@@ -346,21 +273,24 @@ bool cmdStage2(World* world, void* inUserData) {
     Print("ZmqPub plugin load\n");
 
     // DiskIO_UGens does a similar allocation on heap during plugin load. So it must be OK.
-    if (gWorkerThread == nullptr)
-    {
-        gWorkerThread = new WorkerThread(world);
-        gWorkerThread->launchThread();
-    }
+    char* address = myCmdData->name; // TODO: rename name
+    int index = (int)myCmdData->x; // TODO: rename x
+
+    if (!gThreadContainer)
+        gThreadContainer = new ThreadContainer();
+
+    gThreadContainer->start(index, address);
 
     // Send a ConnectTask so our thread binds a zmq port.
     // But wait for it to complete so we can capture the context and publisher socket.
 
-    char* address = myCmdData->name;
+    /*
     Task task(START_PUB_SOCKET, 0, address, strlen(address)+1);
     gWorkerThread->send(task);
 
     // now the worker thread owns the address
     myCmdData->name = 0;
+    */
 
     // TODO: wait for a reply from START_PUB_SOCKET
 
@@ -471,8 +401,9 @@ void cmdZmqPub(World* inWorld, void* inUserData, struct sc_msg_iter* args, void*
  *
  */
 
-C_LINKAGE SC_API_EXPORT void unload(InterfaceTable* inTable) {
-    delete gWorkerThread; 
+C_LINKAGE SC_API_EXPORT void unload(InterfaceTable* inTable) 
+{
+    delete gThreadContainer;
 }
 
 // the entry point is called by the host when the plug-in is loaded
