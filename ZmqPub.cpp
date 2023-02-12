@@ -10,6 +10,7 @@ static InterfaceTable *ft;
 
 #define MAX_PUB_SOCKETS 32
 #define CONTROLLER_SOCKET_ADDR "ipc://c:/sc/test"
+
 #define CHECK_ZMQ_RC(OP) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return; }
 #define CHECK_ZMQ_RC(OP, RET) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return RET; }
 
@@ -82,7 +83,7 @@ public:
             break;
         }
 
-        std::cout << "RTFree taskd data" << std::endl;
+        std::cout << "RTFree task data" << std::endl;
         RTFree(context.world, data); // free(0) is no-op
 
         std::cout << "NRTUnLock" << std::endl;
@@ -202,18 +203,10 @@ private:
             mHasData.WaitEach();
             Print("Got a signal\n");
 
-            while (1)
-            {
-                Task task;
-                bool popSucceeded = mTaskQueue.pop(&task, 1);
-
-                Print("popSucceeded=%d\n", popSucceeded);
-
-                if (popSucceeded)
-                    task.perform(context);
-                else
-                    break;
-            }
+            // Consumes all avaiable tasks from the queue, one at a time
+            Task task;
+            while(mTaskQueue.pop(&task, 1))
+                task.perform(context);
         }
 
         Print("Stopping the thread\n");
@@ -232,50 +225,21 @@ public:
     ZmqPub() {
         Print("ZmqPub constructor\n");
 
-        // test zmq pub
-        Print("Sending Hello\n");
+        // Initialize the unit generator state variables.
+        allocateBuffer();
 
-        size_t dataSize = sizeof(float) * 4;
-        float* data = (float*)RTAlloc(mWorld, dataSize);
-        data[0] = 0.1f;
-        data[1] = 0.2f;
-        data[2] = 0.3f;
-        data[3] = 0.4f;
-
-        if (gWorkerThread)
-        {
-            // TODO: fetch index from args
-            Task task(PUBLISH, 0/*index*/, data, dataSize);
-            gWorkerThread->send(task);
-        }
-
-        // 1. set the calculation function.
-        if (isAudioRateIn(0)) {
-            // if the frequency argument is audio rate
+        // Set the calculation function. set_calc_function also computes the initial sample
+        if (isAudioRateIn(0))
+            // Audio rate
             set_calc_function<ZmqPub,&ZmqPub::next_a>();
-        } else {    
-        // if thene frequency argument is control rate (or a scalar).
+        else // Control rate (or a scalar)
             set_calc_function<ZmqPub,&ZmqPub::next_k>();
-        }   
-
-        // 2. initialize the unit generator state variables.
-        // initialize a constant for multiplying the frequency
-        mFreqMul = 2.0 * sampleDur();
-        // get initial phase of oscillator
-        mPhase = in0(1);
-
-        // 3. calculate one sample of output.
-        if (isAudioRateIn(0)) {
-            next_a(1);
-        } else {
-            next_k(1);
-        }
     }
 
 private:
-    double mPhase; // phase of the oscillator, from -1 to 1.
-    float mFreqMul; // a constant for multiplying frequency
-    //////////////////////////////////////////////////////////////////
+    float* buffer;
+    int bufferSize;
+    int index;
 
     // The calculation function executes once per control period
     // which is typically 64 samples.
@@ -287,37 +251,23 @@ private:
         float *outBuf = out(0);
 
         // get the pointer to the input buffer
-        const float *freq = in(0);
-
-        // get phase and freqmul constant from struct and store it in a
-        // local variable.
-        // The optimizer will cause them to be loaded it into a register.
-        float freqmul = mFreqMul;
-        double phase = mPhase;
+        const float *inBuf = in(0);
 
         // perform a loop for the number of samples in the control period.
         // If this unit is audio rate then inNumSamples will be 64 or whatever
         // the block size is. If this unit is control rate then inNumSamples will
         // be 1.
-        for (int i=0; i < inNumSamples; ++i)
+        for (int i = 0; i < inNumSamples; ++i)
         {
-            // out must be written last for in place operation
-            float z = phase;
-            phase += freq[i] * freqmul;
+            float in = inBuf[i];
 
-            // these if statements wrap the phase a +1 or -1.
-            if (phase >= 1.f) phase -= 2.f;
-            else if (phase <= -1.f) phase += 2.f;
+            // write the buffer
+            stream(in);
 
             // write the output
-            outBuf[i] = z;
+            outBuf[i] = in;
         }
-
-        // store the phase back to the struct
-        mPhase = phase;
     }
-
-    //////////////////////////////////////////////////////////////////
 
     // calculation function for a control rate frequency argument
     void next_k(int inNumSamples)
@@ -325,36 +275,45 @@ private:
         // get the pointer to the output buffer
         float *outBuf = out(0);
 
-        // freq is control rate, so calculate it once.
-        float freq = in0(0) * mFreqMul;
+        // in is control rate, so calculate it once.
+        float in = in0(0);
 
-        // get phase from struct and store it in a local variable.
-        // The optimizer will cause it to be loaded it into a register.
-        double phase = mPhase;
+        // sending one sample per rate
+        stream(in);
 
-        // since the frequency is not changing then we can simplify the loops
-        // by separating the cases of positive or negative frequencies.
-        // This will make them run faster because there is less code inside the loop.
-        if (freq >= 0.f) {
-            // positive frequencies
-            for (int i=0; i < inNumSamples; ++i)
+        for (int i=0; i < inNumSamples; ++i)
+            outBuf[i] = in;
+    }
+
+    inline void stream(float sample)
+    {
+        buffer[index++] = sample;
+
+        if (index > bufferSize)
+        {
+            if (gWorkerThread)
             {
-                outBuf[i] = phase;
-                phase += freq;
-                if (phase >= 1.f) phase -= 2.f;
+                Print("Sending the buffer\n");
+                // TODO: fetch index from args
+                Task task(PUBLISH, 0/*index*/, buffer, sizeof(float) * bufferSize);
+                gWorkerThread->send(task);
+
+                // the thread will take ownership of that buffer so allocate a new one
+                allocateBuffer();
             }
-        } else {
-            // negative frequencies
-            for (int i=0; i < inNumSamples; ++i)
+            else
             {
-                outBuf[i] = phase;
-                phase += freq;
-                if (phase <= -1.f) phase += 2.f;
+                Print("Thread is not alive resetting the buffer\n");
+                index = 0;
             }
         }
+    }
 
-        // store the phase back to the struct
-        mPhase = phase;
+    void allocateBuffer()
+    {
+        bufferSize = 64; // TODO: fetch this from args, bufferSize must be greater than zero
+        buffer = (float*)RTAlloc(mWorld, sizeof(float)*bufferSize);
+        index = 0;
     }
 };
 
