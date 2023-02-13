@@ -19,6 +19,11 @@ static InterfaceTable *ft;
 struct Payload
 {
     float data[PAYLOAD_SIZE];
+
+    Payload()
+    {
+        memset(data, 0, PAYLOAD_SIZE * sizeof(float));
+    }
 };
 
 class PubWorkerThread
@@ -73,7 +78,7 @@ private:
         void* pubSocket = zmq_socket(zmqContext, ZMQ_PUB);
 
         int rc = zmq_bind(pubSocket, address);
-        CHECK_ZMQ_RC1("zmq_bind in startPubSocket");
+        CHECK_ZMQ_RC1("zmq_bind in ioThreadFunc");
 
         while (mRunning.load()) 
         {
@@ -87,14 +92,24 @@ private:
             {
                 Print("publishing payload\n");
 
-                int rc = zmq_send(pubSocket, payload.data, sizeof(payload.data), ZMQ_NOBLOCK);
+                size_t msgSize = sizeof(payload.data);
+                void* msg = malloc(msgSize);
+                
+                if (!msg)
+                    continue;
+
+                memcpy(msg, payload.data, msgSize);
+
+                int rc = zmq_send(pubSocket, msg, msgSize, ZMQ_NOBLOCK);
                 CHECK_ZMQ_RC1("zmq_send on payload send");
 
                 Print("publishing payload end\n");
             }
         }
 
-        zmq_close(pubSocket);
+        rc = zmq_close(pubSocket);
+        CHECK_ZMQ_RC1("zmq_close in ioThreadFunc");
+
         Print("Stopping the thread\n");
     }
 };
@@ -103,12 +118,12 @@ class ThreadContainer
 {
     PubWorkerThread* threads[MAX_PUB_SOCKETS];
     void* zmqContext = nullptr;
-    rw_spinlock lock;
+    rw_spinlock lock[MAX_PUB_SOCKETS];
 
 public:
     void start(int index, const char* address)
     {
-        rw_spinlock::scoped_lock _(lock);
+        rw_spinlock::scoped_lock _(lock[index]);
 
         if (threads[index])
             delete threads[index];
@@ -123,7 +138,7 @@ public:
 
     void stop(int index)
     {
-        rw_spinlock::scoped_lock _(lock);
+        rw_spinlock::scoped_lock _(lock[index]);
 
         if (threads[index])
             delete threads[index];
@@ -133,39 +148,48 @@ public:
 
     void send(int index, Payload& payload)
     {
-        if (!lock.try_lock_shared())
+        if (!lock[index].try_lock_shared())
             return;
 
         if (threads[index])
             threads[index]->send(payload);
 
-        lock.unlock_shared();
+        lock[index].unlock_shared();
     }
 
     ~ThreadContainer()
     {
-        rw_spinlock::scoped_lock _(lock);
+        Print("~ThreadContainer start\n");
 
         for (int i = 0; i < MAX_PUB_SOCKETS; ++i)
         {
+            rw_spinlock::scoped_lock _(lock[i]);
+
             if (threads[i])
                 delete threads[i];
         }
 
+        Print("Destroying zmq context\n");
         zmq_ctx_destroy(zmqContext);
+        Print("~ThreadContainer end\n");
     }
 };
 
-ThreadContainer* gThreadContainer = nullptr;
+struct PluginData // data for the global instance of the plugin
+{
+    ThreadContainer* threads = nullptr;
+};
+
+PluginData gPlugin; // global
 
 // declare struct to hold unit generator state
-struct ZmqPub : public SCUnit {
+struct ZmqOut : public SCUnit {
 // Constructor usually does 3 things.
 // 1. set the calculation function.
 // 2. initialize the unit generator state variables.
 // 3. calculate one sample of output.
 public:
-    ZmqPub() {
+    ZmqOut() {
         Print("ZmqPub constructor\n");
 
         // Initialize the unit generator state variables.
@@ -175,9 +199,9 @@ public:
         // Set the calculation function. set_calc_function also computes the initial sample
         if (isAudioRateIn(0))
             // Audio rate
-            set_calc_function<ZmqPub,&ZmqPub::next_a>();
+            set_calc_function<ZmqOut,&ZmqOut::next_a>();
         else // Control rate (or a scalar)
-            set_calc_function<ZmqPub,&ZmqPub::next_k>();
+            set_calc_function<ZmqOut,&ZmqOut::next_k>();
     }
 
 private:
@@ -231,79 +255,54 @@ private:
 
     inline void stream(float sample)
     {
-        if (!gThreadContainer)
+        if (!gPlugin.threads)
             return;
 
         payload.data[payloadIndex++] = sample;
 
-        if (payloadIndex > PAYLOAD_SIZE)
+        if (payloadIndex >= PAYLOAD_SIZE)
         {
-            gThreadContainer->send(index, payload);
+            gPlugin.threads->send(index, payload);
             payloadIndex = 0;
         }
     }
 };
 
-
-// example of implementing a plug in command with async execution.
-
-struct MyPluginData // data for the global instance of the plugin
+struct CmdData // data for each command
 {
-    float a, b;
+    PluginData* myPlugin;
+    int index;
+    char* address;
 };
 
-struct MyCmdData // data for each command
+bool cmdStage2(World* world, void* inUserData) 
 {
-    MyPluginData* myPlugin;
-    float x, y;
-    char* name;
-};
-
-MyPluginData gMyPlugin; // global
-
-bool cmdStage2(World* world, void* inUserData) {
     // user data is the command.
-    MyCmdData* myCmdData = (MyCmdData*)inUserData;
+    CmdData* cmdData = (CmdData*)inUserData;
 
     // just print out the values
-    Print("cmdStage2 a %g  b %g  x %g  y %g  name %s\n", myCmdData->myPlugin->a, myCmdData->myPlugin->b, myCmdData->x,
-        myCmdData->y, myCmdData->name);
+    Print("cmdStage2 index %d addres %s\n", cmdData->index, cmdData->address);
 
     // ZMQ TEST
     Print("ZmqPub plugin load\n");
 
-    // DiskIO_UGens does a similar allocation on heap during plugin load. So it must be OK.
-    char* address = myCmdData->name; // TODO: rename name
-    int index = (int)myCmdData->x; // TODO: rename x
+    if (!gPlugin.threads)
+        gPlugin.threads = new ThreadContainer();
 
-    if (!gThreadContainer)
-        gThreadContainer = new ThreadContainer();
-
-    gThreadContainer->start(index, address);
-
-    // Send a ConnectTask so our thread binds a zmq port.
-    // But wait for it to complete so we can capture the context and publisher socket.
-
-    /*
-    Task task(START_PUB_SOCKET, 0, address, strlen(address)+1);
-    gWorkerThread->send(task);
-
-    // now the worker thread owns the address
-    myCmdData->name = 0;
-    */
+    gPlugin.threads->start(cmdData->index, cmdData->address);
 
     // TODO: wait for a reply from START_PUB_SOCKET
 
     return true;
 }
 
-bool cmdStage3(World* world, void* inUserData) {
+bool cmdStage3(World* world, void* inUserData) 
+{
     // user data is the command.
-    MyCmdData* myCmdData = (MyCmdData*)inUserData;
+    CmdData* cmdData = (CmdData*)inUserData;
 
     // just print out the values
-    Print("cmdStage3 a %g  b %g  x %g  y %g  name %s\n", myCmdData->myPlugin->a, myCmdData->myPlugin->b, myCmdData->x,
-        myCmdData->y, myCmdData->name);
+    Print("cmdStage3 index %d addres %s\n", cmdData->index, cmdData->address);
 
     // scsynth will perform completion message after this returns
     return true;
@@ -311,78 +310,63 @@ bool cmdStage3(World* world, void* inUserData) {
 
 bool cmdStage4(World* world, void* inUserData) {
     // user data is the command.
-    MyCmdData* myCmdData = (MyCmdData*)inUserData;
+    CmdData* cmdData = (CmdData*)inUserData;
 
     // just print out the values
-    Print("cmdStage4 a %g  b %g  x %g  y %g  name %s\n", myCmdData->myPlugin->a, myCmdData->myPlugin->b, myCmdData->x,
-        myCmdData->y, myCmdData->name);
+    Print("cmdStage4 index %d addres %s\n", cmdData->index, cmdData->address);
 
     // scsynth will send /done after this returns
     return true;
 }
 
-void cmdCleanup(World* world, void* inUserData) {
+void cmdCleanup(World* world, void* inUserData) 
+{
     // user data is the command.
-    MyCmdData* myCmdData = (MyCmdData*)inUserData;
+    CmdData* cmdData = (CmdData*)inUserData;
 
-    Print("cmdCleanup a %g  b %g  x %g  y %g  name %s\n", myCmdData->myPlugin->a, myCmdData->myPlugin->b, myCmdData->x,
-        myCmdData->y, myCmdData->name);
+    Print("cmdCleanup index %d addres %s\n", cmdData->index, cmdData->address);
 
-    RTFree(world, myCmdData->name); // free the string
-    RTFree(world, myCmdData); // free command data
+    RTFree(world, cmdData->address); // free the string
+    RTFree(world, cmdData); // free command data
     // scsynth will delete the completion message for you.
 }
 
-void cmdZmqPub(World* inWorld, void* inUserData, struct sc_msg_iter* args, void* replyAddr) {
-    Print("->cmdZmqPub %p\n", inUserData);
+void cmdZmqOut(World* inWorld, void* inUserData, struct sc_msg_iter* args, void* replyAddr) 
+{
+    Print("->cmdZmqOut %p\n", inUserData);
 
     // user data is the plug-in's user data.
-    MyPluginData* thePlugInData = (MyPluginData*)inUserData;
+    PluginData* plugInData = (PluginData*)inUserData;
 
     // allocate command data, free it in cmdCleanup.
-    MyCmdData* myCmdData = (MyCmdData*)RTAlloc(inWorld, sizeof(MyCmdData));
-    if (!myCmdData) {
-        Print("cmdZmqPub: memory allocation failed!\n");
+    CmdData* cmdData = (CmdData*)RTAlloc(inWorld, sizeof(CmdData));
+    if (!cmdData) 
+    {
+        Print("cmdZmqOut: memory allocation failed!\n");
         return;
     }
-    myCmdData->myPlugin = thePlugInData;
+
+    cmdData->myPlugin = plugInData;
+    cmdData->address = "tcp://*:5555";
 
     // ..get data from args..
-    myCmdData->x = 0.;
-    myCmdData->y = 0.;
-    myCmdData->name = 0;
+    cmdData->index = args->geti(0); // default index is 0
 
-    // float arguments
-    myCmdData->x = args->getf();
-    myCmdData->y = args->getf();
-
-    // how to pass a string argument:
-    const char* name = args->gets(); // get the string argument
-    if (name) {
-        myCmdData->name = (char*)RTAlloc(inWorld, strlen(name) + 1); // allocate space, free it in cmdCleanup.
-        if (!myCmdData->name) {
-            Print("cmdZmqPub: memory allocation failed!\n");
+    const char* address = args->gets(); // get the string argument
+    if (address) 
+    {
+        cmdData->address = (char*)RTAlloc(inWorld, strlen(address) + 1); // allocate space, free it in cmdCleanup.
+        if (!cmdData->address) 
+        {
+            Print("cmdZmqOut: memory allocation failed!\n");
             return;
         }
-        strcpy(myCmdData->name, name); // copy the string
+
+        #pragma warning(suppress: 4996)
+        strcpy(cmdData->address, address); // copy the string
     }
 
-    // how to pass a completion message
-    int msgSize = args->getbsize();
-    char* msgData = 0;
-    if (msgSize) {
-        // allocate space for completion message
-        // scsynth will delete the completion message for you.
-        msgData = (char*)RTAlloc(inWorld, msgSize);
-        if (!msgData) {
-            Print("cmdZmqPub: memory allocation failed!\n");
-            return;
-        }
-        args->getb(msgData, msgSize); // copy completion message.
-    }
-
-    DoAsynchronousCommand(inWorld, replyAddr, "cmdDemoFunc", (void*)myCmdData, (AsyncStageFn)cmdStage2,
-        (AsyncStageFn)cmdStage3, (AsyncStageFn)cmdStage4, cmdCleanup, msgSize, msgData);
+    DoAsynchronousCommand(inWorld, replyAddr, "cmdDemoFunc", cmdData, cmdStage2, cmdStage3, cmdStage4, cmdCleanup, 0, nullptr);
 
     Print("<-cmdDemoFunc\n");
 }
@@ -390,34 +374,28 @@ void cmdZmqPub(World* inWorld, void* inUserData, struct sc_msg_iter* args, void*
 /*
  * to test the above, send the server these commands:
  *
- *
- * SynthDef(\sine, { Out.ar(0, SinOsc.ar(800,0,0.2)) }).load(s);
- * s.sendMsg(\cmd, \zmqPub, 7, 9, \mno, [\s_new, \sine, 900, 0, 0]);
- * s.sendMsg(\n_free, 900);
- * s.sendMsg(\cmd, \zmqPub, 7, 9, \mno);
- * s.sendMsg(\cmd, \zmqPub, 7, 9);
- * s.sendMsg(\cmd, \zmqPub, 7);
- * s.sendMsg(\cmd, \zmqPub);
+ * s.sendMsg(\cmd, \zmqOut, 0, "tcp://*:5555");
+ * s.sendMsg(\cmd, \zmqOut, 0);
+ * s.sendMsg(\cmd, \zmqOut);
  *
  */
 
-C_LINKAGE SC_API_EXPORT void unload(InterfaceTable* inTable) 
+C_LINKAGE SC_API_EXPORT void unload(InterfaceTable* inTable)
 {
-    delete gThreadContainer;
+    delete gPlugin.threads;
 }
 
 // the entry point is called by the host when the plug-in is loaded
-PluginLoad(ZmqPubUGens) {
+PluginLoad(ZmqPubUGens) 
+{
     // InterfaceTable *inTable implicitly given as argument to the load function
     ft = inTable; // store pointer to InterfaceTable
 
     // registerUnit takes the place of the Define*Unit functions. It automatically checks for the presence of a
     // destructor function.
     // However, it does not seem to be possible to disable buffer aliasing with the C++ header.
-    registerUnit<ZmqPub>(ft, "ZmqPub");
+    registerUnit<ZmqOut>(ft, "ZmqOut");
 
-    // define a plugin command - example code
-    gMyPlugin.a = 1.2f;
-    gMyPlugin.b = 3.4f;
-    DefinePlugInCmd("zmqPub", cmdZmqPub, (void*)&gMyPlugin);
+    // define a plugin command
+    DefinePlugInCmd("zmqOut", cmdZmqOut, (void*)&gPlugin);
 }
