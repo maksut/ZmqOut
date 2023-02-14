@@ -26,14 +26,25 @@ struct Payload
     }
 };
 
+struct VPayload
+{
+    void* data;
+    size_t dataSize;
+    zmq_free_fn* freeFn;
+
+    VPayload(void* data, size_t dataSize, zmq_free_fn* freeFn):data(data), dataSize(dataSize), freeFn(freeFn){}
+};
+
 class PubWorkerThread
 {
     SC_SyncCondition mHasData;
 
 #ifdef SUPERNOVA
     boost::lockfree::queue<Payload, boost::lockfree::capacity<PUB_QUEUE_SIZE>> mPubQueue;
+    boost::lockfree::queue<VPayload, boost::lockfree::capacity<PUB_QUEUE_SIZE>> mVPubQueue;
 #else
     boost::lockfree::spsc_queue<Payload, boost::lockfree::capacity<PUB_QUEUE_SIZE>> mPubQueue;
+    boost::lockfree::spsc_queue<VPayload, boost::lockfree::capacity<PUB_QUEUE_SIZE>> mVPubQueue;
 #endif
 
     std::atomic<bool> mRunning;
@@ -69,6 +80,16 @@ public:
         return pushSucceeded;
     }
 
+    bool vSend(VPayload& payload)
+    {
+        bool pushSucceeded = mVPubQueue.push(payload);
+
+        if (pushSucceeded)
+            mHasData.Signal();
+
+        return pushSucceeded;
+    }
+
 private:
     void ioThreadFunc(void* zmqContext, const char* address) 
     {
@@ -86,24 +107,30 @@ private:
             mHasData.WaitEach();
             Print("Got a signal\n");
 
-            // Consumes all avaiable tasks from the queue, one at a time
             Payload payload;
-            while (mPubQueue.pop(&payload, 1))
+            if (mPubQueue.pop(&payload))
             {
                 Print("publishing payload\n");
 
-                size_t msgSize = sizeof(payload.data);
-                void* msg = malloc(msgSize);
-                
-                if (!msg)
-                    continue;
-
-                memcpy(msg, payload.data, msgSize);
-
-                int rc = zmq_send(pubSocket, msg, msgSize, ZMQ_NOBLOCK);
+                int rc = zmq_send(pubSocket, payload.data, sizeof(payload.data), ZMQ_NOBLOCK);
                 CHECK_ZMQ_RC1("zmq_send on payload send");
 
                 Print("publishing payload end\n");
+            }
+
+            VPayload vPayload(nullptr, 0, nullptr);
+            if (mVPubQueue.pop(&vPayload))
+            {
+                Print("publishing vpayload\n");
+
+                zmq_msg_t msg;
+                int rc = zmq_msg_init_data(&msg, vPayload.data, vPayload.dataSize, vPayload.freeFn, nullptr);
+                CHECK_ZMQ_RC1("zmq_send on zmq_msg_init_data");
+
+                rc = zmq_msg_send(&msg, pubSocket, ZMQ_NOBLOCK);
+                CHECK_ZMQ_RC1("zmq_send on vpayload send");
+
+                Print("publishing vpayload end\n");
             }
         }
 
@@ -157,6 +184,17 @@ public:
         lock[index].unlock_shared();
     }
 
+    void vSend(int index, VPayload& vPayload)
+    {
+        if (!lock[index].try_lock_shared())
+            return;
+
+        if (threads[index])
+            threads[index]->vSend(vPayload);
+
+        lock[index].unlock_shared();
+    }
+
     ~ThreadContainer()
     {
         Print("~ThreadContainer start\n");
@@ -164,9 +202,7 @@ public:
         for (int i = 0; i < MAX_PUB_SOCKETS; ++i)
         {
             rw_spinlock::scoped_lock _(lock[i]);
-
-            if (threads[i])
-                delete threads[i];
+            delete threads[i];
         }
 
         Print("Destroying zmq context\n");
@@ -271,9 +307,47 @@ private:
 struct CmdData // data for each command
 {
     PluginData* myPlugin;
+    char* cmd;
     int index;
     char* address;
+    int bufferNum;
 };
+
+void freeFn(void* data, void* hint)
+{
+    free(data);
+}
+
+void bufferStream(World* world, int socketIndex, int bufferNum)
+{
+    void* data = nullptr;
+    size_t dataSize = 0;
+
+    SndBuf* buf = World_GetNRTBuf(world, bufferNum);
+
+    // only single channel buffers for now
+    // and with a single big chunk
+    if (buf && buf->data && buf->channels == 1) 
+    {
+        Print("Copying buffer data\n");
+        dataSize = (buf->frames) * sizeof(float);
+        data = malloc(dataSize);
+
+        if (data)
+            memcpy(data, buf->data, dataSize);
+    }
+    else
+        Print("Couldn't get buffer %d\n", bufferNum);
+
+    if (data)
+    {
+        Print("Sending buffer data\n");
+        VPayload vPayload(data, dataSize, freeFn);
+        gPlugin.threads->vSend(socketIndex, vPayload);
+    }
+    else
+        Print("No buffer data to send\n");
+}
 
 bool cmdStage2(World* world, void* inUserData) 
 {
@@ -281,7 +355,7 @@ bool cmdStage2(World* world, void* inUserData)
     CmdData* cmdData = (CmdData*)inUserData;
 
     // just print out the values
-    Print("cmdStage2 index %d addres %s\n", cmdData->index, cmdData->address);
+    Print("cmdStage2 cmd %s index %d addres %s bufferNum %d\n", cmdData->cmd, cmdData->index, cmdData->address, cmdData->bufferNum);
 
     // ZMQ TEST
     Print("ZmqPub plugin load\n");
@@ -289,7 +363,12 @@ bool cmdStage2(World* world, void* inUserData)
     if (!gPlugin.threads)
         gPlugin.threads = new ThreadContainer();
 
-    gPlugin.threads->start(cmdData->index, cmdData->address);
+    if (strcmp(cmdData->cmd, "start") == 0)
+        gPlugin.threads->start(cmdData->index, cmdData->address);
+    else if (strcmp(cmdData->cmd, "stop") == 0)
+        gPlugin.threads->stop(cmdData->index);
+    else if (strcmp(cmdData->cmd, "streamBuffer") == 0)
+        bufferStream(world, cmdData->index, cmdData->bufferNum);
 
     // TODO: wait for a reply from START_PUB_SOCKET
 
@@ -302,7 +381,7 @@ bool cmdStage3(World* world, void* inUserData)
     CmdData* cmdData = (CmdData*)inUserData;
 
     // just print out the values
-    Print("cmdStage3 index %d addres %s\n", cmdData->index, cmdData->address);
+    Print("cmdStage3 cmd %s index %d addres %s bufferNum %d\n", cmdData->cmd, cmdData->index, cmdData->address, cmdData->bufferNum);
 
     // scsynth will perform completion message after this returns
     return true;
@@ -313,7 +392,7 @@ bool cmdStage4(World* world, void* inUserData) {
     CmdData* cmdData = (CmdData*)inUserData;
 
     // just print out the values
-    Print("cmdStage4 index %d addres %s\n", cmdData->index, cmdData->address);
+    Print("cmdStage4 cmd %s index %d addres %s bufferNum %d\n", cmdData->cmd, cmdData->index, cmdData->address, cmdData->bufferNum);
 
     // scsynth will send /done after this returns
     return true;
@@ -324,11 +403,28 @@ void cmdCleanup(World* world, void* inUserData)
     // user data is the command.
     CmdData* cmdData = (CmdData*)inUserData;
 
-    Print("cmdCleanup index %d addres %s\n", cmdData->index, cmdData->address);
+    Print("cmdCleanup cmd %s index %d addres %s bufferNum %d\n", cmdData->cmd, cmdData->index, cmdData->address, cmdData->bufferNum);
 
-    RTFree(world, cmdData->address); // free the string
-    RTFree(world, cmdData); // free command data
-    // scsynth will delete the completion message for you.
+    RTFree(world, cmdData->cmd);
+    RTFree(world, cmdData->address);
+    RTFree(world, cmdData);
+}
+
+char* getStringArg(World* world, struct sc_msg_iter* args, const char* default)
+{
+    const char* source = args->gets(default);
+    char* dest = (char*)RTAlloc(world, strlen(source) + 1); // allocate space, free it in cmdCleanup.
+
+    if (!dest)
+    {
+        Print("cmdZmqOut: memory allocation failed!\n");
+        return nullptr;
+    }
+
+    #pragma warning(suppress: 4996)
+    strcpy(dest, source); // copy the string
+
+    return dest;
 }
 
 void cmdZmqOut(World* inWorld, void* inUserData, struct sc_msg_iter* args, void* replyAddr) 
@@ -347,26 +443,23 @@ void cmdZmqOut(World* inWorld, void* inUserData, struct sc_msg_iter* args, void*
     }
 
     cmdData->myPlugin = plugInData;
-    cmdData->address = "tcp://*:5555";
 
     // ..get data from args..
+    cmdData->cmd = getStringArg(inWorld, args, "start");
     cmdData->index = args->geti(0); // default index is 0
 
-    const char* address = args->gets(); // get the string argument
-    if (address) 
+    if (strcmp(cmdData->cmd, "streamBuffer") == 0)
     {
-        cmdData->address = (char*)RTAlloc(inWorld, strlen(address) + 1); // allocate space, free it in cmdCleanup.
-        if (!cmdData->address) 
-        {
-            Print("cmdZmqOut: memory allocation failed!\n");
-            return;
-        }
-
-        #pragma warning(suppress: 4996)
-        strcpy(cmdData->address, address); // copy the string
+        cmdData->address = nullptr;
+        cmdData->bufferNum = args->geti(0); // default bufferNum is 0
+    }
+    else
+    {
+        cmdData->address = getStringArg(inWorld, args, "tcp://*:5555");
+        cmdData->bufferNum = 0;
     }
 
-    DoAsynchronousCommand(inWorld, replyAddr, "cmdDemoFunc", cmdData, cmdStage2, cmdStage3, cmdStage4, cmdCleanup, 0, nullptr);
+    DoAsynchronousCommand(inWorld, replyAddr, "zmqOut", cmdData, cmdStage2, cmdStage3, cmdStage4, cmdCleanup, 0, nullptr);
 
     Print("<-cmdDemoFunc\n");
 }
@@ -374,10 +467,15 @@ void cmdZmqOut(World* inWorld, void* inUserData, struct sc_msg_iter* args, void*
 /*
  * to test the above, send the server these commands:
  *
- * s.sendMsg(\cmd, \zmqOut, 0, "tcp://*:5555");
- * s.sendMsg(\cmd, \zmqOut, 0);
+ * s.sendMsg(\cmd, \zmqOut, \start, 0, "tcp://*:5555");
+ * s.sendMsg(\cmd, \zmqOut, \start, 0);
+ * s.sendMsg(\cmd, \zmqOut, \start);
  * s.sendMsg(\cmd, \zmqOut);
  *
+ * s.sendMsg(\cmd, \zmqOut, \stop, 0);
+ * 
+ * s.sendMsg(\cmd, \zmqOut, \streamBuffer, 0, 0);
+ * s.sendMsg(\cmd, \zmqOut, \streamBuffer);
  */
 
 C_LINKAGE SC_API_EXPORT void unload(InterfaceTable* inTable)
