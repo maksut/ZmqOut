@@ -97,8 +97,4 @@ endif()
 find_package(ZeroMQ CONFIG REQUIRED)
 target_link_libraries(${PROJECT} PRIVATE libzmq-static)
 
-# add a test executable
-add_executable(test test.cpp ) 
-target_link_libraries(test PRIVATE libzmq-static)
-
-# TODO: linux
+# TODO: linux & mac

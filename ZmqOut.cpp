@@ -16,14 +16,13 @@ static InterfaceTable *ft;
 #define CHECK_ZMQ_RC1(OP) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return; }
 #define CHECK_ZMQ_RC2(OP, RET) if (rc < 0) { Print("%s failed with %d : %s\n", OP, rc, zmq_strerror(zmq_errno())); return RET; }
 
+#ifdef NDEBUG
+#define Print(...)
+#endif
+
 struct Payload
 {
     float data[PAYLOAD_SIZE];
-
-    Payload()
-    {
-        memset(data, 0, PAYLOAD_SIZE * sizeof(float));
-    }
 };
 
 struct VPayload
@@ -101,14 +100,16 @@ private:
         int rc = zmq_bind(pubSocket, address);
         CHECK_ZMQ_RC1("zmq_bind in ioThreadFunc");
 
+        Payload payload;
+        VPayload vPayload(nullptr, 0, nullptr);
+
         while (mRunning.load()) 
         {
             Print("Waiting for new data\n");
             mHasData.WaitEach();
             Print("Got a signal\n");
 
-            Payload payload;
-            if (mPubQueue.pop(&payload))
+            if (mPubQueue.pop(&payload, 1))
             {
                 Print("publishing payload\n");
 
@@ -117,9 +118,7 @@ private:
 
                 Print("publishing payload end\n");
             }
-
-            VPayload vPayload(nullptr, 0, nullptr);
-            if (mVPubQueue.pop(&vPayload))
+            else if (mVPubQueue.pop(&vPayload, 1))
             {
                 Print("publishing vpayload\n");
 
@@ -229,7 +228,6 @@ public:
         Print("ZmqPub constructor\n");
 
         // Initialize the unit generator state variables.
-        index = 0; // TODO: fetch from args
         payloadIndex = 0;
 
         // Set the calculation function. set_calc_function also computes the initial sample
@@ -243,7 +241,6 @@ public:
 private:
     Payload payload;
     int payloadIndex;
-    int index;
 
     // The calculation function executes once per control period
     // which is typically 64 samples.
@@ -257,6 +254,9 @@ private:
         // get the pointer to the input buffer
         const float *inBuf = in(0);
 
+        // socket index
+        const int socketIndex = (int)in0(1);
+
         // perform a loop for the number of samples in the control period.
         // If this unit is audio rate then inNumSamples will be 64 or whatever
         // the block size is. If this unit is control rate then inNumSamples will
@@ -266,7 +266,7 @@ private:
             float in = inBuf[i];
 
             // write the buffer
-            stream(in);
+            stream(in, socketIndex);
 
             // write the output
             outBuf[i] = in;
@@ -281,15 +281,16 @@ private:
 
         // in is control rate, so calculate it once.
         float in = in0(0);
+        int socketIndex = (int)in0(1);
 
         // sending one sample per rate
-        stream(in);
+        stream(in, socketIndex);
 
         for (int i=0; i < inNumSamples; ++i)
             outBuf[i] = in;
     }
 
-    inline void stream(float sample)
+    inline void stream(float sample, int socketIndex)
     {
         if (!gPlugin.threads)
             return;
@@ -298,7 +299,7 @@ private:
 
         if (payloadIndex >= PAYLOAD_SIZE)
         {
-            gPlugin.threads->send(index, payload);
+            gPlugin.threads->send(socketIndex, payload);
             payloadIndex = 0;
         }
     }
@@ -357,9 +358,7 @@ bool cmdStage2(World* world, void* inUserData)
     // just print out the values
     Print("cmdStage2 cmd %s index %d addres %s bufferNum %d\n", cmdData->cmd, cmdData->index, cmdData->address, cmdData->bufferNum);
 
-    // ZMQ TEST
-    Print("ZmqPub plugin load\n");
-
+    // create a thread container if there's none
     if (!gPlugin.threads)
         gPlugin.threads = new ThreadContainer();
 
@@ -369,8 +368,6 @@ bool cmdStage2(World* world, void* inUserData)
         gPlugin.threads->stop(cmdData->index);
     else if (strcmp(cmdData->cmd, "streamBuffer") == 0)
         bufferStream(world, cmdData->index, cmdData->bufferNum);
-
-    // TODO: wait for a reply from START_PUB_SOCKET
 
     return true;
 }
