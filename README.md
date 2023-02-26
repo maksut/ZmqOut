@@ -1,5 +1,5 @@
 ### ZmqOut
-A (very) experimental supercollider plugin that allows streaming SC data out via ZeroMQ sockets. It that provides:
+A (very) experimental supercollider plugin that allows streaming SC data out via ZeroMQ sockets. It provides:
 - `ZmqOut` UGen
 - `zmqOut` plugin command
 
